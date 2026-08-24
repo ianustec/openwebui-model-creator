@@ -3,10 +3,10 @@ title: Model Creator
 author: IANUSTEC
 author_url: https://ianustec.com
 funding_url: https://github.com/ianustec/openwebui-model-creator
-description: Create and save Open WebUI Workspace Models (agent presets) from Markdown/JSON — native function calling, auto-bind knowledge/tools/skills/actions/capabilities, private by default
+description: Create and save Open WebUI Workspace Models (agent presets) from Markdown/JSON — native function calling, auto-bind knowledge/tools/skills/actions/capabilities, edit bindings on existing models, private by default
 requirements: httpx, pydantic, PyYAML
 required_open_webui_version: 0.10.0
-version: 1.0.0
+version: 1.1.0
 license: MIT
 """
 
@@ -31,6 +31,7 @@ import re
 import traceback
 import unicodedata
 from typing import Any, Optional
+from urllib.parse import quote
 
 from pydantic import BaseModel, Field
 
@@ -1228,6 +1229,8 @@ class Tools:
             self._descriptor_update(),
             self._descriptor_validate(),
             self._descriptor_list_options(),
+            self._descriptor_list_models(),
+            self._descriptor_edit_model(),
         ]
 
     async def _emit_status(self, emitter, description: str, *, done: bool) -> None:
@@ -1511,6 +1514,237 @@ class Tools:
         )
         return reply
 
+    # ── Public: list_models ──────────────────────────────────────────────────
+    async def list_models(
+        self,
+        __event_emitter__=None,
+        __request__=None,
+        __user__=None,
+    ) -> str:
+        """List Workspace Models visible to the user, with current bindings.
+
+        Use this to ask the user which model should get a skill/tool/knowledge
+        bound by default (e.g. after creating a skill with Skill Creator).
+        """
+        await self._emit_status(
+            __event_emitter__, "Loading your models...", done=False
+        )
+        try:
+            status, data = await _models_api(
+                request=__request__,
+                method="GET",
+                path="/list",
+                api_base_override=self.valves.owui_api_base,
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            return _error_reply(str(exc))
+        if status != 200:
+            return _error_reply(_format_api_error(status, data))
+
+        items = _items_from_list_payload(data)
+        await self._emit_status(__event_emitter__, "Models loaded.", done=True)
+        if not items:
+            return (
+                "[TOOL_RESULT — use the text below as your final reply, "
+                "verbatim.]\n\n"
+                "No workspace models visible to you. Create one first with "
+                "`create_model`."
+            )
+
+        lines = []
+        for m in items:
+            meta = m.get("meta") if isinstance(m.get("meta"), dict) else {}
+            skills = meta.get("skillIds") or []
+            tools = meta.get("toolIds") or []
+            know = meta.get("knowledge") or []
+            know_ids = [
+                k.get("id") if isinstance(k, dict) else k for k in know
+            ]
+            active = "active" if m.get("is_active", True) else "inactive"
+            writable = m.get("write_access", True)
+            lock = "" if writable else " _(read-only for you)_"
+            lines.append(
+                f"- `{m.get('id')}` — **{m.get('name')}** "
+                f"(base: `{m.get('base_model_id') or '—'}`, {active}){lock}\n"
+                f"  - skills: {skills or '[]'} · tools: {tools or '[]'}"
+                + (f" · knowledge: {know_ids}" if know_ids else "")
+            )
+        return (
+            "[TOOL_RESULT — show this list to the user and ask WHICH model "
+            "should get the new binding by default. Then call edit_model "
+            "with the chosen id.]\n\n"
+            "Your workspace models:\n\n" + "\n".join(lines)
+        )
+
+    # ── Public: edit_model ───────────────────────────────────────────────────
+    async def edit_model(
+        self,
+        model_id: str,
+        add_skill_ids: Optional[list[str]] = None,
+        remove_skill_ids: Optional[list[str]] = None,
+        add_tool_ids: Optional[list[str]] = None,
+        remove_tool_ids: Optional[list[str]] = None,
+        add_action_ids: Optional[list[str]] = None,
+        remove_action_ids: Optional[list[str]] = None,
+        add_knowledge_ids: Optional[list[str]] = None,
+        remove_knowledge_ids: Optional[list[str]] = None,
+        reason: str = "",
+        __event_emitter__=None,
+        __request__=None,
+        __user__=None,
+    ) -> str:
+        """Edit bindings on an EXISTING Workspace Model, preserving its config.
+
+        Fetches the current model, merges the requested add/remove lists into
+        meta (skillIds / toolIds / actionIds / knowledge), and saves. Use this
+        to enable a freshly created skill by default on a model the user picks.
+
+        Typical flow: list_models → ask the user which model → edit_model(
+        model_id=..., add_skill_ids=["new-skill-id"]).
+
+        Args:
+            model_id: Existing model id (must be writable by the user).
+            add_skill_ids / remove_skill_ids: skill ids to bind/unbind.
+            add_tool_ids / remove_tool_ids: tool ids to bind/unbind.
+            add_action_ids / remove_action_ids: action ids to bind/unbind.
+            add_knowledge_ids / remove_knowledge_ids: knowledge collection ids.
+            reason: Short human note of why (echoed in the confirmation).
+
+        Returns:
+            Confirmation with the before/after bindings.
+        """
+        mid = (model_id or "").strip()
+        if not mid:
+            return _error_reply("model_id is required")
+
+        def _merge(existing: list, add: Optional[list], rem: Optional[list]) -> list:
+            out = [str(x) for x in existing if x]
+            for r in (rem or []):
+                out = [x for x in out if x != str(r)]
+            for a in (add or []):
+                a = str(a).strip()
+                if a and a not in out:
+                    out.append(a)
+            return out
+
+        await self._emit_status(
+            __event_emitter__, f"Loading model `{mid}`...", done=False
+        )
+        try:
+            status, data = await _models_api(
+                request=__request__,
+                method="GET",
+                path=f"/model?id={quote(mid, safe='')}",
+                api_base_override=self.valves.owui_api_base,
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            return _error_reply(str(exc))
+        if status != 200 or not isinstance(data, dict):
+            return _error_reply(_format_api_error(status, data))
+
+        if data.get("write_access") is False:
+            return _error_reply(
+                f"You have read-only access to model `{mid}`. "
+                "Ask the owner to bind the skill, or pick another model."
+            )
+
+        meta = dict(data.get("meta") or {})
+        before = {
+            "skillIds": list(meta.get("skillIds") or []),
+            "toolIds": list(meta.get("toolIds") or []),
+            "actionIds": list(meta.get("actionIds") or []),
+            "knowledge": list(meta.get("knowledge") or []),
+        }
+
+        meta["skillIds"] = _merge(before["skillIds"], add_skill_ids, remove_skill_ids)
+        meta["toolIds"] = _merge(before["toolIds"], add_tool_ids, remove_tool_ids)
+        meta["actionIds"] = _merge(before["actionIds"], add_action_ids, remove_action_ids)
+
+        existing_kids = [
+            k.get("id") if isinstance(k, dict) else str(k)
+            for k in before["knowledge"]
+        ]
+        merged_kids = _merge(existing_kids, add_knowledge_ids, remove_knowledge_ids)
+        name_by_id = {
+            (k.get("id") if isinstance(k, dict) else str(k)): (
+                k.get("name") if isinstance(k, dict) else str(k)
+            )
+            for k in before["knowledge"]
+        }
+        meta["knowledge"] = [
+            {
+                "id": kid,
+                "name": name_by_id.get(kid) or kid,
+                "type": "collection",
+            }
+            for kid in merged_kids
+        ]
+
+        form = {
+            "id": data.get("id") or mid,
+            "base_model_id": data.get("base_model_id"),
+            "name": data.get("name") or mid,
+            "meta": meta,
+            "params": data.get("params") or {},
+            "access_grants": data.get("access_grants") or [],
+            "is_active": bool(data.get("is_active", True)),
+        }
+
+        changes: list[str] = []
+        for key, label in (("skillIds", "Skills"), ("toolIds", "Tools"),
+                           ("actionIds", "Actions")):
+            if before[key] != meta[key]:
+                changes.append(
+                    f"- {label}: {before[key] or '[]'} → **{meta[key] or '[]'}**"
+                )
+        if [k.get("id") for k in before["knowledge"] if isinstance(k, dict)] != merged_kids and before["knowledge"] != meta["knowledge"]:
+            changes.append(
+                f"- Knowledge: {existing_kids or '[]'} → **{merged_kids or '[]'}**"
+            )
+        if not changes:
+            return (
+                "[TOOL_RESULT — use the text below as your final reply, "
+                "verbatim.]\n\n"
+                f"Nothing to change on **{form['name']}** (`{mid}`) — the "
+                "requested bindings are already in place."
+            )
+
+        await self._emit_status(
+            __event_emitter__, f"Saving model `{mid}`...", done=False
+        )
+        try:
+            status, data = await _models_api(
+                request=__request__,
+                method="POST",
+                path="/model/update",
+                json_body=form,
+                api_base_override=self.valves.owui_api_base,
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            return _error_reply(str(exc))
+        if status not in (200, 201):
+            await self._emit_status(__event_emitter__, "Update failed.", done=True)
+            return _error_reply(_format_api_error(status, data))
+
+        await self._emit_status(__event_emitter__, "Model updated.", done=True)
+        reason_line = f"\n_{reason}_\n" if reason else ""
+        return (
+            "[TOOL_RESULT]\n\n"
+            "OUTPUT_FOR_USER — Your **next assistant message** must be **only** "
+            "the text between the dashed lines (`---`) below. Copy it exactly. "
+            "Do not add summaries or extra sentences.\n\n"
+            "---\n"
+            f"Model updated: **{form['name']}** (`{mid}`)\n"
+            f"{reason_line}\n"
+            + "\n".join(changes)
+            + "\n\nThe new bindings are active by default in every new chat "
+            "with this model.\n"
+            "---\n"
+        )
+
     # ── Public: update_model ─────────────────────────────────────────────────
     async def update_model(
         self,
@@ -1737,6 +1971,100 @@ class Tools:
                         },
                     },
                     "required": ["content"],
+                },
+            },
+        }
+
+    @staticmethod
+    def _descriptor_list_models() -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": "list_models",
+                "description": (
+                    "List the Workspace Models visible to the current user "
+                    "with their current bindings (skills, tools, knowledge) "
+                    "and write access. Call this after creating a skill/tool "
+                    "to ask the user WHICH model should get it enabled by "
+                    "default, then call edit_model with the chosen id."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                },
+            },
+        }
+
+    @staticmethod
+    def _descriptor_edit_model() -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": "edit_model",
+                "description": (
+                    "Edit bindings on an EXISTING Workspace Model while "
+                    "preserving its config: add/remove skillIds, toolIds, "
+                    "actionIds and knowledge collections. Use this to enable "
+                    "a freshly created skill by default on a model the user "
+                    "chooses (flow: list_models → user picks → edit_model "
+                    "with add_skill_ids=[skill_id]). Fetches the current "
+                    "model first, so nothing else is lost."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "model_id": {
+                            "type": "string",
+                            "description": "Existing model id (writable by the user).",
+                        },
+                        "add_skill_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Skill ids to bind by default.",
+                        },
+                        "remove_skill_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Skill ids to unbind.",
+                        },
+                        "add_tool_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Tool ids to bind.",
+                        },
+                        "remove_tool_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Tool ids to unbind.",
+                        },
+                        "add_action_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Action ids to bind.",
+                        },
+                        "remove_action_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Action ids to unbind.",
+                        },
+                        "add_knowledge_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Knowledge collection ids to attach.",
+                        },
+                        "remove_knowledge_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Knowledge collection ids to detach.",
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Short note echoed in the confirmation.",
+                            "default": "",
+                        },
+                    },
+                    "required": ["model_id"],
                 },
             },
         }
