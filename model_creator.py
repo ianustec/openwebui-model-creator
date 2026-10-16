@@ -158,25 +158,28 @@ _DEFAULT_FEATURE_KEYS = ("web_search", "image_generation", "code_interpreter")
 _INFER_RULES: list[tuple[tuple[str, ...], dict]] = [
     (
         ("knowledge", "rag", "document", "documenti", "kb", "base conoscenza",
-         "manuale", "policy", "handbook"),
+         "manuale", "policy", "handbook", "connaissance", "connaissances",
+         "base documentaire", "documents"),
         {"builtin": ["knowledge"], "caps": ["file_context"], "prefer": "knowledge"},
     ),
     (
-        ("web", "search", "ricerca", "internet", "news", "notizie"),
+        ("web", "search", "ricerca", "internet", "news", "notizie",
+         "recherche web", "actualités"),
         {"builtin": ["web_search"], "features": ["web_search"], "caps": ["web_search"]},
     ),
     (
-        ("image", "immagine", "draw", "genera img", "dall-e", "vision", "foto"),
+        ("image", "immagine", "draw", "genera img", "dall-e", "vision", "foto",
+         "images", "dessin", "photo"),
         {"builtin": ["image_generation"], "features": ["image_generation"],
          "caps": ["vision", "image_generation"]},
     ),
     (
-        ("code", "python", "interpreter", "calcolo", "execute", "codice"),
+        ("code", "python", "interpreter", "calcolo", "execute", "codice", "calcul"),
         {"builtin": ["code_interpreter"], "features": ["code_interpreter"],
          "caps": ["code_interpreter"]},
     ),
     (
-        ("memory", "memoria", "ricorda", "remember"),
+        ("memory", "memoria", "ricorda", "remember", "mémoire", "souviens-toi"),
         {"builtin": ["memory"]},
     ),
     (
@@ -184,35 +187,40 @@ _INFER_RULES: list[tuple[tuple[str, ...], dict]] = [
         {"builtin": ["notes"]},
     ),
     (
-        ("calendar", "calendario", "meeting", "riunione", "appuntamento"),
+        ("calendar", "calendario", "meeting", "riunione", "appuntamento",
+         "calendrier", "réunion", "rendez-vous"),
         {"builtin": ["calendar"]},
     ),
     (
-        ("task", "todo", "piano", "planner", "checklist"),
+        ("task", "todo", "piano", "planner", "checklist",
+         "tâche", "tâches", "liste de tâches", "planning"),
         {"builtin": ["tasks"]},
     ),
     (
-        ("automat", "schedule", "cron"),
+        ("automat", "schedule", "cron", "automation", "automazione",
+         "automatisation", "planifier"),
         {"builtin": ["automations"]},
     ),
     (
-        ("chat history", "storico chat", "conversazioni passate"),
+        ("chat history", "storico chat", "conversazioni passate",
+         "historique des conversations"),
         {"builtin": ["chats"]},
     ),
     (
-        ("channel", "canale", "slack"),
+        ("channel", "canale", "slack", "canal"),
         {"builtin": ["channels"]},
     ),
     (
-        ("skill", "playbook", "guideline", "linee guida"),
+        ("skill", "skills", "playbook", "guideline", "linee guida",
+         "compétence", "compétences", "procédure"),
         {"prefer": "skills"},
     ),
     (
-        ("tool", "strumento", "mcp"),
+        ("tool", "tools", "strumento", "mcp", "outil", "outils"),
         {"prefer": "tools"},
     ),
     (
-        ("action", "azione", "button"),
+        ("action", "actions", "azione", "button", "bouton"),
         {"prefer": "actions"},
     ),
 ]
@@ -330,57 +338,62 @@ def _normalize_builtin_tools(raw: Any) -> dict[str, bool]:
     return {}
 
 
+_BINDING_ALIASES = {
+    "skillIds": ("skillIds", "skill_ids", "skills"),
+    "toolIds": ("toolIds", "tool_ids", "tools"),
+    "actionIds": ("actionIds", "action_ids", "actions"),
+    "filterIds": ("filterIds", "filter_ids", "filters"),
+    "defaultFeatureIds": ("defaultFeatureIds", "default_feature_ids", "default_features"),
+    "builtinTools": ("builtinTools", "builtin_tools"),
+    "capabilities": ("capabilities",),
+    "knowledge": ("knowledge",),
+}
+
+
 def _extract_bindings(raw: dict, meta_extra: dict) -> dict:
-    """Pull binding fields from a raw dict + nested meta."""
-    return {
-        "skillIds": _as_str_list(
-            raw.get("skillIds") or raw.get("skill_ids") or raw.get("skills")
-            or meta_extra.get("skillIds")
-        ),
-        "toolIds": _as_str_list(
-            raw.get("toolIds") or raw.get("tool_ids") or raw.get("tools")
-            or meta_extra.get("toolIds")
-        ),
-        "actionIds": _as_str_list(
-            raw.get("actionIds") or raw.get("action_ids") or raw.get("actions")
-            or meta_extra.get("actionIds")
-        ),
-        "filterIds": _as_str_list(
-            raw.get("filterIds") or raw.get("filter_ids") or raw.get("filters")
-            or meta_extra.get("filterIds")
-        ),
-        "defaultFeatureIds": _as_str_list(
-            raw.get("defaultFeatureIds")
-            or raw.get("default_feature_ids")
-            or raw.get("default_features")
-            or meta_extra.get("defaultFeatureIds")
-        ),
-        "builtinTools": _normalize_builtin_tools(
-            raw.get("builtinTools")
-            or raw.get("builtin_tools")
-            or meta_extra.get("builtinTools")
-        ),
-        "capabilities": (
-            raw.get("capabilities")
-            or meta_extra.get("capabilities")
-            or {}
-        ),
-        "knowledge": _normalize_knowledge(
-            raw.get("knowledge") or meta_extra.get("knowledge")
-        ),
-    }
+    """Pull bindings by presence, not truthiness; top-level aliases win over meta."""
+    bindings: dict = {}
+    explicit: list[str] = []
+    for key, aliases in _BINDING_ALIASES.items():
+        value = None
+        for source in (raw, meta_extra):
+            found = next((alias for alias in aliases if alias in source), None)
+            if found is not None:
+                value = source[found]
+                explicit.append(key)
+                break
+        if key == "capabilities":
+            bindings[key] = value if isinstance(value, dict) else {}
+        elif key == "builtinTools":
+            bindings[key] = _normalize_builtin_tools(value)
+        elif key == "knowledge":
+            bindings[key] = _normalize_knowledge(value)
+        else:
+            bindings[key] = _as_str_list(value)
+    # Normalization supplies empty defaults too: retain which ones were intentional.
+    bindings["_explicit_bindings"] = explicit
+    return bindings
+
+
+def _explicit_binding_keys(spec: dict) -> set[str]:
+    return set(spec.get("_explicit_bindings", set(spec) & _BINDING_ALIASES.keys()))
 
 
 def _has_explicit_bindings(spec: dict) -> bool:
-    return bool(
-        spec.get("skillIds")
-        or spec.get("toolIds")
-        or spec.get("actionIds")
-        or spec.get("filterIds")
-        or spec.get("knowledge")
-        or spec.get("defaultFeatureIds")
-        or spec.get("builtinTools")
-    )
+    return bool(_explicit_binding_keys(spec))
+
+
+def _fold_text(text: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKD", text.lower())
+                   if not unicodedata.combining(c))
+
+
+def _matches_keyword(blob: str, keyword: str) -> bool:
+    pattern = r"\b" + re.escape(_fold_text(keyword)) + r"\b"
+    # A French address field is not a request for a code interpreter.
+    if keyword == "code":
+        pattern += r"(?!\s+postal\b)"
+    return re.search(pattern, blob, re.IGNORECASE) is not None
 
 
 def _context_blob(spec: dict, extra: str = "") -> str:
@@ -391,7 +404,7 @@ def _context_blob(spec: dict, extra: str = "") -> str:
         spec.get("system") or "",
         extra or "",
     ]
-    return " ".join(parts).lower()
+    return _fold_text(" ".join(parts))
 
 
 def _is_vague_request(spec: dict, context: str = "") -> bool:
@@ -411,7 +424,7 @@ def _is_vague_request(spec: dict, context: str = "") -> bool:
         return True
     # No infer-rule keyword hit
     for keywords, _ in _INFER_RULES:
-        if any(k in blob for k in keywords):
+        if any(_matches_keyword(blob, k) for k in keywords):
             return False
     return len(blob) < 80
 
@@ -420,7 +433,9 @@ def _infer_from_context(spec: dict, catalog: dict, context: str = "") -> dict:
     """Mutate a copy of spec with inferred capabilities / builtin / bindings."""
     out = dict(spec)
     blob = _context_blob(spec, context)
-    caps = dict(_DEFAULT_CAPABILITIES)
+    explicit = _explicit_binding_keys(spec)
+    empty = {key for key in explicit if not spec.get(key)}
+    caps = {} if "capabilities" in empty else dict(_DEFAULT_CAPABILITIES)
     if isinstance(out.get("capabilities"), dict) and out["capabilities"]:
         caps.update(out["capabilities"])
     builtin: dict[str, bool] = dict(out.get("builtinTools") or {})
@@ -428,15 +443,17 @@ def _infer_from_context(spec: dict, catalog: dict, context: str = "") -> dict:
     prefer_skills = prefer_tools = prefer_actions = prefer_knowledge = False
 
     for keywords, hints in _INFER_RULES:
-        if not any(k in blob for k in keywords):
+        if not any(_matches_keyword(blob, k) for k in keywords):
             continue
         for b in hints.get("builtin") or []:
-            builtin[b] = True
+            if "builtinTools" not in explicit:
+                builtin[b] = True
         for f in hints.get("features") or []:
-            if f not in features:
+            if "defaultFeatureIds" not in empty and f not in features:
                 features.append(f)
         for c in hints.get("caps") or []:
-            caps[c] = True
+            if "capabilities" not in empty:
+                caps[c] = True
         pref = hints.get("prefer")
         if pref == "skills":
             prefer_skills = True
@@ -449,7 +466,7 @@ def _infer_from_context(spec: dict, catalog: dict, context: str = "") -> dict:
 
     # Always keep core agentic builtins on unless explicitly disabled
     for core in ("time", "tasks"):
-        if core not in builtin:
+        if "builtinTools" not in explicit and core not in builtin:
             builtin[core] = True
 
     # Match catalog items by name/description keywords in blob
@@ -457,12 +474,12 @@ def _infer_from_context(spec: dict, catalog: dict, context: str = "") -> dict:
         scored: list[tuple[int, str]] = []
         for it in items:
             iid = str(it.get("id") or "")
-            label = f"{it.get('name') or ''} {it.get('description') or ''}".lower()
+            label = _fold_text(f"{it.get('name') or ''} {it.get('description') or ''}")
             if not iid:
                 continue
             score = 0
             for token in re.findall(r"[a-z0-9]{4,}", label):
-                if token in blob:
+                if _matches_keyword(blob, token):
                     score += 1
             if score:
                 scored.append((score, iid))
@@ -474,19 +491,19 @@ def _infer_from_context(spec: dict, catalog: dict, context: str = "") -> dict:
     action_ids = list(out.get("actionIds") or [])
     knowledge = list(out.get("knowledge") or [])
 
-    if prefer_skills or "skill" in blob:
+    if "skillIds" not in empty and prefer_skills:
         for sid in _match_items(catalog.get("skills") or []):
             if sid not in skill_ids:
                 skill_ids.append(sid)
-    if prefer_tools or "tool" in blob or "strument" in blob:
+    if "toolIds" not in empty and prefer_tools:
         for tid in _match_items(catalog.get("tools") or []):
             if tid not in tool_ids:
                 tool_ids.append(tid)
-    if prefer_actions or "action" in blob:
+    if "actionIds" not in empty and prefer_actions:
         for aid in _match_items(catalog.get("actions") or []):
             if aid not in action_ids:
                 action_ids.append(aid)
-    if prefer_knowledge or "knowledge" in blob or "document" in blob:
+    if "knowledge" not in empty and prefer_knowledge:
         for kid in _match_items(catalog.get("knowledge") or []):
             if not any(k.get("id") == kid for k in knowledge):
                 # find name
@@ -496,8 +513,10 @@ def _infer_from_context(spec: dict, catalog: dict, context: str = "") -> dict:
                         name = it.get("name") or kid
                         break
                 knowledge.append({"id": kid, "name": name, "type": "collection"})
-            builtin["knowledge"] = True
-            caps["file_context"] = True
+            if "builtinTools" not in explicit:
+                builtin["knowledge"] = True
+            if "capabilities" not in empty:
+                caps["file_context"] = True
 
     out["capabilities"] = caps
     out["builtinTools"] = builtin
@@ -569,6 +588,7 @@ def _parse_model_content(content: Any, *, default_base: str = "") -> dict:
             ).strip(),
             "system": str(params.get("system") or "").strip(),
             "tags": tags,
+            "_explicit_bindings": bindings["_explicit_bindings"],
             "skillIds": bindings["skillIds"],
             "toolIds": bindings["toolIds"],
             "actionIds": bindings["actionIds"],
@@ -655,6 +675,7 @@ def _parse_model_content(content: Any, *, default_base: str = "") -> dict:
         ).strip(),
         "system": str(params.get("system") or "").strip(),
         "tags": _normalize_tags(fm.get("tags") or meta_extra.get("tags")),
+        "_explicit_bindings": bindings["_explicit_bindings"],
         "skillIds": bindings["skillIds"],
         "toolIds": bindings["toolIds"],
         "actionIds": bindings["actionIds"],
@@ -740,34 +761,35 @@ def _to_model_form(spec: dict, *, is_active: bool, private: bool) -> dict:
     if tags:
         meta["tags"] = tags
 
+    explicit = _explicit_binding_keys(spec)
     skill_ids = list(spec.get("skillIds") or [])
-    if skill_ids:
+    if skill_ids or "skillIds" in explicit:
         meta["skillIds"] = skill_ids
     tool_ids = list(spec.get("toolIds") or [])
-    if tool_ids:
+    if tool_ids or "toolIds" in explicit:
         meta["toolIds"] = tool_ids
     action_ids = list(spec.get("actionIds") or [])
-    if action_ids:
+    if action_ids or "actionIds" in explicit:
         meta["actionIds"] = action_ids
     filter_ids = list(spec.get("filterIds") or [])
-    if filter_ids:
+    if filter_ids or "filterIds" in explicit:
         meta["filterIds"] = filter_ids
     feature_ids = list(spec.get("defaultFeatureIds") or [])
-    if feature_ids:
+    if feature_ids or "defaultFeatureIds" in explicit:
         meta["defaultFeatureIds"] = feature_ids
 
     caps = spec.get("capabilities")
-    if isinstance(caps, dict) and caps:
+    if isinstance(caps, dict) and (caps or "capabilities" in explicit):
         meta["capabilities"] = caps
     else:
         meta["capabilities"] = dict(_DEFAULT_CAPABILITIES)
 
     builtin = spec.get("builtinTools")
-    if isinstance(builtin, dict) and builtin:
+    if isinstance(builtin, dict) and (builtin or "builtinTools" in explicit):
         meta["builtinTools"] = builtin
 
     knowledge = spec.get("knowledge")
-    if knowledge:
+    if knowledge or "knowledge" in explicit:
         meta["knowledge"] = knowledge
 
     payload: dict[str, Any] = {
